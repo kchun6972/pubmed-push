@@ -369,43 +369,35 @@ def build_wecom_markdown(articles_with_reports: list[dict]) -> str:
 # ============================================================
 #  企业微信群机器人推送（Webhook）
 # ============================================================
-def push_to_wecom_bot(articles_with_reports: list[dict]) -> bool:
+def push_to_wecom_bot(articles_with_reports: list[dict]):
     if not WECOM_WEBHOOK_KEY:
         print("[SKIP] 未设置 WECOM_WEBHOOK_KEY，跳过推送")
-        return False
+        return
 
     content = build_wecom_markdown(articles_with_reports)
     url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={WECOM_WEBHOOK_KEY}"
 
-    # 企业微信机器人限制 4096 字节，超出则逐篇发送
     max_bytes = 4000
     encoded = content.encode("utf-8")
 
-    if len(encoded) <= max_bytes:
-        payload = {"msgtype": "markdown", "markdown": {"content": content}}
+    def _send(c):
         try:
-            resp = requests.post(url, json=payload, timeout=30)
-            data = resp.json()
+            r = requests.post(url, json={"msgtype": "markdown", "markdown": {"content": c}}, timeout=15)
+            data = r.json()
             if data.get("errcode") == 0:
-                print(f"[OK] 企业微信推送成功")
+                print(f"  [OK] 企业微信推送成功")
                 return True
             else:
-                print(f"[FAIL] 推送失败: {data}")
+                print(f"  [FAIL] 企业微信推送失败: {data}")
                 return False
         except Exception as e:
-            print(f"[ERROR] 推送异常: {e}")
+            print(f"  [ERROR] 推送异常: {e}")
             return False
 
-    # 超长：逐篇推送
-    print(f"  [INFO] 总内容 {len(encoded)} 字节，超过限制，将逐篇推送")
+    if len(encoded) <= max_bytes:
+        return _send(content)
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    overview_content = (
-        f"# PubMed 文献周报\n检索时间：{now}\n"
-        f"共 {len(articles_with_reports)} 篇文献，以下逐篇推送。"
-    )
-    requests.post(url, json={"msgtype": "markdown", "markdown": {"content": overview_content}}, timeout=15)
-
+    print(f"  [INFO] 总内容 {len(encoded)} 字节，超限，逐篇推送")
     for item in articles_with_reports:
         art = item["article"]
         ttitle = item.get("translated_title", "")
@@ -418,7 +410,6 @@ def push_to_wecom_bot(articles_with_reports: list[dict]) -> bool:
         lines.append("")
         lines.append(f"**作者：**{art.get('authors', '未知')[:80]}")
         lines.append(f"**期刊：**{art.get('journal', '未知')}　**日期：**{art.get('date', '未知')}")
-
         links = []
         if art.get("pmid_link"):
             links.append(f"[PubMed]({art['pmid_link']})")
@@ -429,7 +420,6 @@ def push_to_wecom_bot(articles_with_reports: list[dict]) -> bool:
         if links:
             lines.append(f"**链接：**{' | '.join(links)}")
         lines.append("")
-
         if report:
             clean = report
             idx = report.find("【研究背景与目的】")
@@ -441,20 +431,13 @@ def push_to_wecom_bot(articles_with_reports: list[dict]) -> bool:
             clean = clean.replace("【结论与意义】", "**结论与意义**")
             clean = clean.replace("【局限性】", "**局限性**")
             lines.append(clean)
-
-        one_content = "\n".join(lines)
-        one_encoded = one_content.encode("utf-8")
-        if len(one_encoded) > max_bytes:
-            one_content = one_encoded[:max_bytes].decode("utf-8", errors="ignore")
-            one_content += "\n\n> ...（内容过长已截断）"
-
-        try:
-            requests.post(url, json={"msgtype": "markdown", "markdown": {"content": one_content}}, timeout=15)
-        except Exception as e:
-            print(f"  [ERROR] 逐篇推送异常: {e}")
+        one = "\n".join(lines)
+        e = one.encode("utf-8")
+        if len(e) > max_bytes:
+            one = e[:max_bytes].decode("utf-8", errors="ignore")
+            one += "\n\n> ..."
+        _send(one)
         time.sleep(1)
-
-    return True
 
 
 # ============================================================
