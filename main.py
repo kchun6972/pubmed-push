@@ -35,8 +35,8 @@ LLM_MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "gpt-4o-mini")
 
 ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL", "")
 
-# Server酱 微信推送配置
-SERVERCHAN_SENDKEY = os.environ.get("SERVERCHAN_SENDKEY", "")
+# 企业微信机器人 Webhook Key（从 Webhook URL 中 ?key= 后面的部分）
+WECOM_WEBHOOK_KEY = os.environ.get("WECOM_WEBHOOK_KEY", "")
 
 
 # ============================================================
@@ -268,16 +268,23 @@ def generate_detailed_report(title: str, text_content: str) -> tuple[str, str]:
         )
         result = resp.choices[0].message.content.strip()
 
-        # 解析中文标题
+        # 解析中文标题（兼容模型输出位置不同）
         translated_title = ""
         report = result
-        if result.startswith("【中文标题】"):
-            rest = result[len("【中文标题】"):].strip()
+        if "【中文标题】" in result:
+            parts = result.split("【中文标题】", 1)
+            rest = parts[1].strip()
             if "\n" in rest:
                 first_line, remainder = rest.split("\n", 1)
                 translated_title = first_line.strip()
-                # 移除可能剩余的空白行
                 report = remainder.strip()
+            else:
+                translated_title = rest
+                report = ""
+        else:
+            # 没找到【中文标题】，把原文标题作为中文标题，保留全部输出
+            if result:
+                report = result
 
         return translated_title, report
     except Exception as e:
@@ -360,29 +367,94 @@ def build_wecom_markdown(articles_with_reports: list[dict]) -> str:
 
 
 # ============================================================
-#  Server酱 微信推送
+#  企业微信群机器人推送（Webhook）
 # ============================================================
-def push_to_serverchan(articles_with_reports: list[dict]) -> bool:
-    if not SERVERCHAN_SENDKEY:
-        print("[SKIP] 未设置 SERVERCHAN_SENDKEY，跳过推送")
+def push_to_wecom_bot(articles_with_reports: list[dict]) -> bool:
+    if not WECOM_WEBHOOK_KEY:
+        print("[SKIP] 未设置 WECOM_WEBHOOK_KEY，跳过推送")
         return False
 
-    desp = build_wecom_markdown(articles_with_reports)
-    title = f"PubMed 文献周报 | {len(articles_with_reports)} 篇新文献"
+    content = build_wecom_markdown(articles_with_reports)
+    url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={WECOM_WEBHOOK_KEY}"
 
-    url = f"https://sctapi.ftqq.com/{SERVERCHAN_SENDKEY}.send"
-    try:
-        resp = requests.post(url, data={"title": title, "desp": desp}, timeout=30)
-        result = resp.json()
-        if resp.status_code == 200 and result.get("code") == 0:
-            print(f"[OK] 微信推送成功")
-            return True
-        else:
-            print(f"[FAIL] 微信推送失败: {result}")
+    # 企业微信机器人限制 4096 字节，超出则逐篇发送
+    max_bytes = 4000
+    encoded = content.encode("utf-8")
+
+    if len(encoded) <= max_bytes:
+        payload = {"msgtype": "markdown", "markdown": {"content": content}}
+        try:
+            resp = requests.post(url, json=payload, timeout=30)
+            data = resp.json()
+            if data.get("errcode") == 0:
+                print(f"[OK] 企业微信推送成功")
+                return True
+            else:
+                print(f"[FAIL] 推送失败: {data}")
+                return False
+        except Exception as e:
+            print(f"[ERROR] 推送异常: {e}")
             return False
-    except Exception as e:
-        print(f"[ERROR] 推送异常: {e}")
-        return False
+
+    # 超长：逐篇推送
+    print(f"  [INFO] 总内容 {len(encoded)} 字节，超过限制，将逐篇推送")
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    overview_content = (
+        f"# PubMed 文献周报\n检索时间：{now}\n"
+        f"共 {len(articles_with_reports)} 篇文献，以下逐篇推送。"
+    )
+    requests.post(url, json={"msgtype": "markdown", "markdown": {"content": overview_content}}, timeout=15)
+
+    for item in articles_with_reports:
+        art = item["article"]
+        ttitle = item.get("translated_title", "")
+        eng_title = art.get("title", "")
+        report = item.get("report", "")
+
+        lines = [f"# {ttitle or eng_title}"]
+        if ttitle:
+            lines.append(f"> 原文：{eng_title}")
+        lines.append("")
+        lines.append(f"**作者：**{art.get('authors', '未知')[:80]}")
+        lines.append(f"**期刊：**{art.get('journal', '未知')}　**日期：**{art.get('date', '未知')}")
+
+        links = []
+        if art.get("pmid_link"):
+            links.append(f"[PubMed]({art['pmid_link']})")
+        if art.get("doi_link"):
+            links.append(f"[DOI]({art['doi_link']})")
+        if art.get("pmc_id"):
+            links.append(f"[PMC](https://www.ncbi.nlm.nih.gov/pmc/articles/{art['pmc_id']}/)")
+        if links:
+            lines.append(f"**链接：**{' | '.join(links)}")
+        lines.append("")
+
+        if report:
+            clean = report
+            idx = report.find("【研究背景与目的】")
+            if idx != -1:
+                clean = report[idx:]
+            clean = clean.replace("【研究背景与目的】", "**研究背景与目的**")
+            clean = clean.replace("【实验模型与方法】", "**实验模型与方法**")
+            clean = clean.replace("【核心发现】", "**核心发现**")
+            clean = clean.replace("【结论与意义】", "**结论与意义**")
+            clean = clean.replace("【局限性】", "**局限性**")
+            lines.append(clean)
+
+        one_content = "\n".join(lines)
+        one_encoded = one_content.encode("utf-8")
+        if len(one_encoded) > max_bytes:
+            one_content = one_encoded[:max_bytes].decode("utf-8", errors="ignore")
+            one_content += "\n\n> ...（内容过长已截断）"
+
+        try:
+            requests.post(url, json={"msgtype": "markdown", "markdown": {"content": one_content}}, timeout=15)
+        except Exception as e:
+            print(f"  [ERROR] 逐篇推送异常: {e}")
+        time.sleep(1)
+
+    return True
 
 
 # ============================================================
@@ -394,8 +466,8 @@ def main():
         sys.exit(1)
     if not LLM_API_KEY:
         print("[WARN] 未设置 LLM_API_KEY，AI 解读将跳过")
-    if not SERVERCHAN_SENDKEY:
-        print("[WARN] 未设置 SERVERCHAN_SENDKEY，推送将跳过")
+    if not WECOM_WEBHOOK_KEY:
+        print("[WARN] 未设置 WECOM_WEBHOOK_KEY，推送将跳过")
 
     Entrez.email = ENTREZ_EMAIL
 
@@ -408,7 +480,7 @@ def main():
     if not pmid_list:
         msg = "本周未检索到相关文献。"
         print(f"[DONE] {msg}")
-        push_to_serverchan([])
+        push_to_wecom_bot([])
         return
 
     # ---- [2/5] 获取详情 ----
@@ -462,7 +534,7 @@ def main():
 
     # ---- [5/5] 推送 ----
     print("[5/5] 正在推送企业微信 ...")
-    push_to_serverchan(articles_with_reports)
+    push_to_wecom_bot(articles_with_reports)
 
     print("\n" + "=" * 60)
     print("全部完成！")
