@@ -17,13 +17,31 @@ from openai import OpenAI
 # ============================================================
 # 全局配置
 # ============================================================
-SEARCH_QUERY = (
-    '("mouse inner ear organoids" OR "minced inner ear tissue" '
-    'OR "E14" OR "E16" OR "neural PDEs" OR "digital twins") '
-    "AND (biology OR medicine)"
-)
+SEARCH_QUERIES = {
+    "AI与类器官工程": (
+        '(organoid*[Title/Abstract] OR "virtual organoid"[Title/Abstract] '
+        'OR "tissue engineering"[Title/Abstract]) '
+        'AND ("artificial intelligence"[Title/Abstract] '
+        'OR "machine learning"[Title/Abstract] '
+        'OR "deep learning"[Title/Abstract] '
+        'OR "digital twin"[Title/Abstract] '
+        'OR "neural differential equation"[Title/Abstract] '
+        'OR "trajectory learning"[Title/Abstract] '
+        'OR "computational modeling"[Title/Abstract] '
+        'OR "protocol optimization"[Title/Abstract])'
+    ),
+    "内耳与类器官研究": (
+        '(organoid*[Title/Abstract] OR "in vitro model"[Title/Abstract] '
+        'OR mechanobiolog*[Title/Abstract] '
+        'OR "extracellular matrix"[Title/Abstract]) '
+        'AND ("inner ear"[Title/Abstract] '
+        'OR cochlea*[Title/Abstract] '
+        'OR vestibular[Title/Abstract] '
+        'OR "hair cell"[Title/Abstract])'
+    ),
+}
 SEARCH_DAYS = 7
-MAX_RESULTS = 20
+MAX_RESULTS = 20          # 每个检索式最多取 N 篇
 FETCH_FULL_TEXT = True     # True=下载PMC全文，False=仅用摘要
 
 # ============================================================
@@ -234,16 +252,15 @@ def generate_detailed_report(title: str, text_content: str) -> tuple[str, str]:
         "输出格式要求如下：\n"
         "【中文标题】<将英文标题翻译为专业通顺的中文标题>\n\n"
         "【研究背景与目的】\n"
-        "<2-3 句话介绍研究背景和拟解决的科学问题>\n\n"
+        "<2-3 句话，保持精炼>\n\n"
         "【实验模型与方法】\n"
-        "<详细介绍使用的实验模型，尤其关注小鼠内耳类器官/切碎组织、"
-        "细胞系或动物模型，以及关键技术手段如单细胞测序、免疫荧光、电生理等>\n\n"
+        "<介绍关键实验模型和技术，保持精炼>\n\n"
         "【核心发现】\n"
-        "<分条列出最重要的实验结果和发现>\n\n"
+        "<每条用 · 开头，分条列出最重要的发现，每条1句话>\n\n"
         "【结论与意义】\n"
-        "<总结研究结论及其对基础研究或临床转化的意义>\n\n"
+        "<1-2 句话>\n\n"
         "【局限性】\n"
-        "<指出研究可能存在的局限性，如样本量、模型局限性等>"
+        "<1 句话>"
     )
 
     try:
@@ -296,9 +313,19 @@ def generate_detailed_report(title: str, text_content: str) -> tuple[str, str]:
 # ============================================================
 def build_wecom_markdown(articles_with_reports: list[dict]) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    # 统计各类别数量
+    cats = {}
+    for item in articles_with_reports:
+        c = item["article"].get("category", "未分类")
+        cats[c] = cats.get(c, 0) + 1
+    cat_summary = " | ".join(f"{k}: {v}" for k, v in cats.items())
+
     lines = [
-        f"# PubMed 文献周报\n",
-        f"> 检索时间：{now}｜共 {len(articles_with_reports)} 篇\n",
+        "# PubMed 文献周报\n",
+        f"> 检索时间：{now}",
+        f"> {cat_summary}\n",
+        "---",
+        "",
     ]
 
     for i, item in enumerate(articles_with_reports, 1):
@@ -306,18 +333,20 @@ def build_wecom_markdown(articles_with_reports: list[dict]) -> str:
         ttitle = item.get("translated_title", "")
         report = item.get("report", "")
         eng_title = art.get("title", "")
+        category = art.get("category", "")
 
-        # --- 标题 ---
-        lines.append(f"## {i}. {ttitle or eng_title}")
+        # --- 序号 + 标题 + 分类标签 ---
+        lines.append(f"### {i}. {ttitle or eng_title}")
         if ttitle:
             lines.append(f"> 原文：{eng_title}")
+        lines.append(f"> `{category}`")
         lines.append("")
 
-        # --- 元信息 ---
-        authors = (art.get("authors") or "")[:80]
-        journal = art.get("journal", "未知")
-        date = art.get("date", "未知")
-        lines.append(f"**作者：**{authors}　**期刊：**{journal}　**日期：**{date}")
+        # --- 元信息（三行分开） ---
+        authors = (art.get("authors") or "")[:60]
+        lines.append(f"**作者：**{authors}")
+        lines.append(f"**期刊：**{art.get('journal', '未知')}")
+        lines.append(f"**日期：**{art.get('date', '未知')}")
 
         links = []
         if art.get("pmid_link"):
@@ -325,38 +354,27 @@ def build_wecom_markdown(articles_with_reports: list[dict]) -> str:
         if art.get("doi_link"):
             links.append(f"[DOI]({art['doi_link']})")
         if art.get("pmc_id"):
-            pmc_link = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{art['pmc_id']}/"
-            links.append(f"[PMC 全文]({pmc_link})")
+            links.append(f"[PMC](https://www.ncbi.nlm.nih.gov/pmc/articles/{art['pmc_id']}/)")
         if links:
             lines.append(f"**链接：**{' | '.join(links)}")
         lines.append("")
 
-        # --- 详细报告（替换 Markdown 标题格式） ---
+        # --- 详细报告 ---
         if report:
             clean = report
-            # 移除已单独显示的 "【中文标题】..." 行
             if "【中文标题】" in clean:
-                clean = clean.split("【", 1)
-                if len(clean) > 1:
-                    # 跳过第一个 【中文标题】段落
-                    parts = report.split("【", 2)
-                    if len(parts) >= 2 and "中文标题" in parts[1]:
-                        # 从头开始，跳过中文标题部分
-                        idx = report.find("【研究背景与目的】")
-                        if idx != -1:
-                            clean = report[idx:]
-                        else:
-                            clean = report
-                    else:
-                        clean = report
-
-            # 将方头括号标题转为企业微信 markdown 粗体
-            clean = clean.replace("【研究背景与目的】", "**研究背景与目的**")
-            clean = clean.replace("【实验模型与方法】", "**实验模型与方法**")
-            clean = clean.replace("【核心发现】", "**核心发现**")
-            clean = clean.replace("【结论与意义】", "**结论与意义**")
-            clean = clean.replace("【局限性】", "**局限性**")
-
+                idx = clean.find("【研究背景与目的】")
+                if idx != -1:
+                    clean = clean[idx:]
+            for old, new in [
+                ("【研究背景与目的】", "\n**背景与目的**"),
+                ("【实验模型与方法】", "\n**方法与模型**"),
+                ("【核心发现】", "\n**核心发现**"),
+                ("【结论与意义】", "\n**结论与意义**"),
+                ("【局限性】", "\n**局限性**"),
+            ]:
+                clean = clean.replace(old, new)
+            clean = clean.strip()
             lines.append(clean)
 
         lines.append("")
@@ -407,9 +425,13 @@ def push_to_wecom_bot(articles_with_reports: list[dict]):
         lines = [f"# {ttitle or eng_title}"]
         if ttitle:
             lines.append(f"> 原文：{eng_title}")
+        category = art.get("category", "")
+        if category:
+            lines.append(f"> `{category}`")
         lines.append("")
-        lines.append(f"**作者：**{art.get('authors', '未知')[:80]}")
-        lines.append(f"**期刊：**{art.get('journal', '未知')}　**日期：**{art.get('date', '未知')}")
+        lines.append(f"**作者：**{art.get('authors', '未知')[:60]}")
+        lines.append(f"**期刊：**{art.get('journal', '未知')}")
+        lines.append(f"**日期：**{art.get('date', '未知')}")
         links = []
         if art.get("pmid_link"):
             links.append(f"[PubMed]({art['pmid_link']})")
@@ -422,14 +444,19 @@ def push_to_wecom_bot(articles_with_reports: list[dict]):
         lines.append("")
         if report:
             clean = report
-            idx = report.find("【研究背景与目的】")
-            if idx != -1:
-                clean = report[idx:]
-            clean = clean.replace("【研究背景与目的】", "**研究背景与目的**")
-            clean = clean.replace("【实验模型与方法】", "**实验模型与方法**")
-            clean = clean.replace("【核心发现】", "**核心发现**")
-            clean = clean.replace("【结论与意义】", "**结论与意义**")
-            clean = clean.replace("【局限性】", "**局限性**")
+            if "【中文标题】" in clean:
+                idx = clean.find("【研究背景与目的】")
+                if idx != -1:
+                    clean = clean[idx:]
+            for old, new in [
+                ("【研究背景与目的】", "\n**背景与目的**"),
+                ("【实验模型与方法】", "\n**方法与模型**"),
+                ("【核心发现】", "\n**核心发现**"),
+                ("【结论与意义】", "\n**结论与意义**"),
+                ("【局限性】", "\n**局限性**"),
+            ]:
+                clean = clean.replace(old, new)
+            clean = clean.strip()
             lines.append(clean)
         one = "\n".join(lines)
         e = one.encode("utf-8")
@@ -454,11 +481,22 @@ def main():
 
     Entrez.email = ENTREZ_EMAIL
 
-    # ---- [1/5] 检索 ----
-    print("[1/5] 正在检索 PubMed ...")
-    print(f"      查询: {SEARCH_QUERY}")
-    pmid_list = search_pubmed(SEARCH_QUERY, SEARCH_DAYS, MAX_RESULTS)
-    print(f"      -> 共找到 {len(pmid_list)} 篇文献")
+    # ---- [1/5] 检索（两套检索式分别检索，合并去重） ----
+    print("[1/5] 正在检索 PubMed（两套检索式） ...")
+    pmid_category = {}  # pmid -> category标签
+    for cat_name, query in SEARCH_QUERIES.items():
+        print(f"      [{cat_name}]")
+        print(f"      查询: {query[:60]}...")
+        pmids = search_pubmed(query, SEARCH_DAYS, MAX_RESULTS)
+        print(f"      -> 找到 {len(pmids)} 篇")
+        for pmid in pmids:
+            if pmid not in pmid_category:
+                pmid_category[pmid] = cat_name
+            else:
+                pmid_category[pmid] += f" + {cat_name}"
+
+    pmid_list = list(pmid_category.keys())
+    print(f"      -> 去重后共 {len(pmid_list)} 篇文献")
 
     if not pmid_list:
         msg = "本周未检索到相关文献。"
@@ -470,6 +508,9 @@ def main():
     print("[2/5] 正在获取文献详细信息 ...")
     xml_data = fetch_pubmed_details(pmid_list)
     articles = parse_articles(xml_data)
+    # 标记分类
+    for art in articles:
+        art["category"] = pmid_category.get(art.get("pmid", ""), "")
     print(f"      -> 成功解析 {len(articles)} 篇文献")
     if not articles:
         print("[DONE] 未解析到有效文献")
