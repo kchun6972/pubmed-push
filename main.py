@@ -35,8 +35,11 @@ LLM_MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "gpt-4o-mini")
 
 ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL", "")
 
-# 企业微信机器人 Webhook Key（从 URL 中 ?key= 后面的部分）
-WECOM_WEBHOOK_KEY = os.environ.get("WECOM_WEBHOOK_KEY", "")
+# 企业微信自建应用配置（需先注册企业微信团队，创建自建应用）
+WECOM_CORP_ID = os.environ.get("WECOM_CORP_ID", "")
+WECOM_AGENT_SECRET = os.environ.get("WECOM_AGENT_SECRET", "")
+WECOM_AGENT_ID = int(os.environ.get("WECOM_AGENT_ID", "0"))
+WECOM_TO_USER = os.environ.get("WECOM_TO_USER", "@all")  # 成员ID，多个用|分隔
 
 
 # ============================================================
@@ -360,62 +363,94 @@ def build_wecom_markdown(articles_with_reports: list[dict]) -> str:
 
 
 # ============================================================
-#  企业微信机器人推送
+#  企业微信自建应用推送（通过应用消息 API）
 # ============================================================
+def get_wecom_token() -> str:
+    """获取企业微信 access_token"""
+    url = f"https://qyapi.weixin.qq.com/cgi-bin/gettoken"
+    params = {"corpid": WECOM_CORP_ID, "corpsecret": WECOM_AGENT_SECRET}
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        data = resp.json()
+        if data.get("errcode") == 0:
+            return data["access_token"]
+        else:
+            print(f"  [FAIL] 获取 token 失败: {data}")
+            return ""
+    except Exception as e:
+        print(f"  [ERROR] 获取 token 异常: {e}")
+        return ""
+
+
+def send_wecom_markdown(content: str) -> bool:
+    """通过企业微信自建应用发送 markdown 消息"""
+    token = get_wecom_token()
+    if not token:
+        return False
+
+    # 企业微信应用 markdown 消息限制 2048 字节
+    max_bytes = 2000
+    encoded = content.encode("utf-8")
+    if len(encoded) > max_bytes:
+        content = encoded[:max_bytes].decode("utf-8", errors="ignore")
+        content += "\n\n> ...（内容过长已截断）"
+
+    url = "https://qyapi.weixin.qq.com/cgi-bin/message/send"
+    payload = {
+        "touser": WECOM_TO_USER,
+        "msgtype": "markdown",
+        "agentid": WECOM_AGENT_ID,
+        "markdown": {"content": content},
+    }
+    try:
+        resp = requests.post(url, params={"access_token": token}, json=payload, timeout=15)
+        data = resp.json()
+        if data.get("errcode") == 0:
+            print(f"  [OK] 企业微信推送成功")
+            return True
+        else:
+            print(f"  [FAIL] 推送失败: {data}")
+            return False
+    except Exception as e:
+        print(f"  [ERROR] 推送异常: {e}")
+        return False
+
+
 def push_to_wecom(articles_with_reports: list[dict]):
-    """支持多消息发送（企业微信单条消息 4096 字节限制）"""
+    """支持长内容拆分多条发送"""
+    if not WECOM_CORP_ID or not WECOM_AGENT_SECRET or not WECOM_AGENT_ID:
+        print("[SKIP] 企业微信未完整配置，跳过推送")
+        return
+
     full_content = build_wecom_markdown(articles_with_reports)
-    max_bytes = 4000
-
-    def _send(content: str) -> bool:
-        if not WECOM_WEBHOOK_KEY:
-            print("[SKIP] 未设置 WECOM_WEBHOOK_KEY，跳过推送")
-            return False
-        url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={WECOM_WEBHOOK_KEY}"
-        payload = {"msgtype": "markdown", "markdown": {"content": content}}
-        try:
-            resp = requests.post(url, json=payload, timeout=30)
-            result = resp.json()
-            if resp.status_code == 200 and result.get("errcode") == 0:
-                print(f"  [OK] 企业微信推送成功")
-                return True
-            else:
-                print(f"  [FAIL] 企业微信推送失败: {result}")
-                return False
-        except Exception as e:
-            print(f"  [ERROR] 推送异常: {e}")
-            return False
-
+    max_bytes = 2000
     encoded = full_content.encode("utf-8")
 
-    # 单条能放下，直接推送
+    # 单条能放下
     if len(encoded) <= max_bytes:
-        return _send(full_content)
+        return send_wecom_markdown(full_content)
 
-    # 超出长度：每篇单独推送
+    # 超长：先发总览，再逐篇推送
     print(f"  [INFO] 总内容 {len(encoded)} 字节，超过限制，将逐篇推送")
 
-    # 先发一条总览
-    overview = f"# PubMed 文献周报\n\n> 检索时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n共检索到 {len(articles_with_reports)} 篇文献，以下逐篇推送详细报告。"
-    _send(overview)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    overview = f"# PubMed 文献周报\n检索时间：{now}\n共 {len(articles_with_reports)} 篇，以下逐篇推送。"
+    send_wecom_markdown(overview)
 
-    # 逐篇发送
     for item in articles_with_reports:
         art = item["article"]
         ttitle = item.get("translated_title", "")
         eng_title = art.get("title", "")
         report = item.get("report", "")
 
-        content = f"# {ttitle or eng_title}\n"
+        lines = [f"# {ttitle or eng_title}"]
         if ttitle:
-            content += f"> 原文：{eng_title}\n"
-        content += "\n"
+            lines.append(f"> 原文：{eng_title}")
+        lines.append("")
 
-        # 元信息
         authors = (art.get("authors") or "")[:80]
-        journal = art.get("journal", "未知")
-        date = art.get("date", "未知")
-        content += f"**作者：**{authors}　**期刊：**{journal}　**日期：**{date}\n"
+        lines.append(f"**作者：**{authors}")
+        lines.append(f"**期刊：**{art.get('journal', '未知')}　**日期：**{art.get('date', '未知')}")
 
         links = []
         if art.get("pmid_link"):
@@ -423,14 +458,12 @@ def push_to_wecom(articles_with_reports: list[dict]):
         if art.get("doi_link"):
             links.append(f"[DOI]({art['doi_link']})")
         if art.get("pmc_id"):
-            pmc_link = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{art['pmc_id']}/"
-            links.append(f"[PMC 全文]({pmc_link})")
+            links.append(f"[PMC](https://www.ncbi.nlm.nih.gov/pmc/articles/{art['pmc_id']}/)")
         if links:
-            content += f"**链接：**{' | '.join(links)}\n"
+            lines.append(f"**链接：**{' | '.join(links)}")
+        lines.append("")
 
-        content += "\n"
         if report:
-            # 同样是格式化处理
             clean = report
             idx = report.find("【研究背景与目的】")
             if idx != -1:
@@ -440,18 +473,11 @@ def push_to_wecom(articles_with_reports: list[dict]):
             clean = clean.replace("【核心发现】", "**核心发现**")
             clean = clean.replace("【结论与意义】", "**结论与意义**")
             clean = clean.replace("【局限性】", "**局限性**")
-            content += clean
+            lines.append(clean)
 
-        # 单篇也截断
-        c_encoded = content.encode("utf-8")
-        if len(c_encoded) > max_bytes:
-            content = c_encoded[:max_bytes].decode("utf-8", errors="ignore")
-            content += "\n\n> ...（内容过长已截断）"
-
-        _send(content)
-        time.sleep(1)  # 避免频率过高
-
-    return True
+        content = "\n".join(lines)
+        send_wecom_markdown(content)
+        time.sleep(1)
 
 
 # ============================================================
@@ -463,8 +489,8 @@ def main():
         sys.exit(1)
     if not LLM_API_KEY:
         print("[WARN] 未设置 LLM_API_KEY，AI 解读将跳过")
-    if not WECOM_WEBHOOK_KEY:
-        print("[WARN] 未设置 WECOM_WEBHOOK_KEY，推送将跳过")
+    if not WECOM_CORP_ID or not WECOM_AGENT_SECRET or not WECOM_AGENT_ID:
+        print("[WARN] 未完整配置企业微信（CORP_ID/AGENT_SECRET/AGENT_ID），推送将跳过")
 
     Entrez.email = ENTREZ_EMAIL
 
