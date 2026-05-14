@@ -30,8 +30,5 @@ jobs:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           LLM_MODEL_NAME: ${{ secrets.LLM_MODEL_NAME }}
-          WECOM_CORP_ID: ${{ secrets.WECOM_CORP_ID }}
-          WECOM_AGENT_SECRET: ${{ secrets.WECOM_AGENT_SECRET }}
-          WECOM_AGENT_ID: ${{ secrets.WECOM_AGENT_ID }}
-          WECOM_TO_USER: ${{ secrets.WECOM_TO_USER }}
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
         run: python main.py
