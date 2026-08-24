@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-内耳发育文献检索 + 单细胞/空间组学优先排序 + AI 证据化解读 + 企业微信推送
+内耳发育 + AI×类器官文献检索、分类排序、AI 证据化解读与企业微信推送
 """
 
 import os
@@ -55,6 +55,24 @@ SEARCH_QUERIES = {
         'OR "in vitro"[Title/Abstract]) '
         f'{REVIEW_EXCLUSION}'
     ),
+    "AI与类器官交叉研究": (
+        '(organoid*[Title/Abstract] OR assembloid*[Title/Abstract] '
+        'OR "patient-derived organoid"[Title/Abstract] '
+        'OR "tumor organoid"[Title/Abstract]) '
+        'AND ("artificial intelligence"[Title/Abstract] '
+        'OR "machine learning"[Title/Abstract] '
+        'OR "deep learning"[Title/Abstract] '
+        'OR "neural network"[Title/Abstract] '
+        'OR "convolutional neural network"[Title/Abstract] '
+        'OR "vision transformer"[Title/Abstract] '
+        'OR "foundation model"[Title/Abstract] '
+        'OR "computer vision"[Title/Abstract] '
+        'OR "digital twin"[Title/Abstract] '
+        'OR "automated phenotyping"[Title/Abstract] '
+        'OR "AI-based image analysis"[Title/Abstract] '
+        'OR "AI-assisted"[Title/Abstract]) '
+        f'{REVIEW_EXCLUSION}'
+    ),
 }
 SEARCH_DAYS = 7
 MAX_RESULTS = 30           # 每个检索式先抓取较大的候选集，再在本地筛选排序
@@ -75,6 +93,17 @@ DEVELOPMENT_KEYWORDS = (
     "development", "developmental", "differentiation", "morphogenesis",
     "lineage", "cell fate", "otic placode", "otic vesicle",
 )
+AI_KEYWORDS = (
+    "artificial intelligence", "machine learning", "deep learning",
+    "neural network", "vision transformer", "foundation model",
+    "computer vision", "digital twin", "automated phenotyping",
+    "ai-based", "ai-assisted",
+)
+CATEGORY_QUOTAS = {
+    "内耳发育·单细胞与空间组学": 4,
+    "内耳发育·机制与类器官": 2,
+    "AI与类器官交叉研究": 2,
+}
 
 # ============================================================
 # API 配置（全部通过环境变量读取）
@@ -268,6 +297,8 @@ def article_relevance_score(article: dict) -> int:
     score = 0
     if "单细胞与空间组学" in category:
         score += 100
+    if "AI与类器官交叉研究" in category:
+        score += 80
     if contains_any(text, SPATIAL_KEYWORDS):
         score += 45
     if contains_any(text, SINGLE_CELL_KEYWORDS):
@@ -278,6 +309,10 @@ def article_relevance_score(article: dict) -> int:
         score += 12
     if contains_any(text, DEVELOPMENT_KEYWORDS):
         score += 12
+    if contains_any(text, AI_KEYWORDS):
+        score += 25
+    if contains_any(title_lower, AI_KEYWORDS):
+        score += 10
     if "organoid" in text:
         score += 6
     if article.get("abstract"):
@@ -297,10 +332,35 @@ def filter_and_rank_articles(articles: list[dict]) -> list[dict]:
 
     # Python 排序稳定；同分时保留 PubMed 的日期排序。
     original_articles.sort(key=lambda item: item["relevance_score"], reverse=True)
-    selected = original_articles[:MAX_PUSH_ARTICLES]
+    selected = []
+    selected_pmids = set()
+
+    # 先按类别保留席位，确保新增的 AI×类器官研究不会挤掉内耳发育主线。
+    for category, quota in CATEGORY_QUOTAS.items():
+        added = 0
+        for article in original_articles:
+            article_key = article.get("pmid") or article.get("title", "")
+            if category not in article.get("category", "") or article_key in selected_pmids:
+                continue
+            selected.append(article)
+            selected_pmids.add(article_key)
+            added += 1
+            if added >= quota or len(selected) >= MAX_PUSH_ARTICLES:
+                break
+        print(f"      -> {category}: 保留 {added}/{quota} 篇")
+
+    # 某类不足配额时，用全局相关性最高的候选补足。
+    for article in original_articles:
+        if len(selected) >= MAX_PUSH_ARTICLES:
+            break
+        article_key = article.get("pmid") or article.get("title", "")
+        if article_key not in selected_pmids:
+            selected.append(article)
+            selected_pmids.add(article_key)
+
     print(
         f"      -> 排除综述后 {len(original_articles)} 篇，"
-        f"按空间组学/单细胞优先选取 {len(selected)} 篇"
+        f"按类别配额与相关性选取 {len(selected)} 篇"
     )
     return selected
 
@@ -444,30 +504,56 @@ def generate_detailed_report(article: dict, text_content: str) -> tuple[str, str
     if not LLM_API_KEY:
         return "", "（未配置 LLM_API_KEY）"
 
-    system_prompt = (
-        "你是专注内耳发育、单细胞组学和空间组学的研究专家。"
+    category = article.get("category", "")
+    evidence_rules = (
         "请只依据用户提供的论文文本进行中文解读，不得用常识补齐论文未报告的信息，"
-        "不得虚构样本量、发育时期、基因、细胞群、统计显著性或分析软件。"
+        "不得虚构样本量、数据规模、模型性能、基因、细胞群、统计显著性或分析软件。"
         "如果文本是摘要，必须降低结论强度；任何关键信息缺失时写‘原文未报告’。"
         "区分作者数据支持的结论与作者讨论中的推测。全文控制在 700-900 个中文字符。\n\n"
-        "严格使用以下格式：\n"
-        "【中文标题】<专业、忠实翻译英文标题>\n\n"
-        "【一句话结论】\n"
-        "<这项研究对内耳发育最重要的贡献；若相关性有限需直说>\n\n"
-        "【发育问题与实验体系】\n"
-        "<物种/组织或类器官、发育阶段或时间点、关键处理；未报告则明确标注>\n\n"
-        "【数据与分析流程】\n"
-        "<样本量、scRNA-seq/snRNA-seq/空间平台，以及质控、整合、聚类、注释、"
-        "差异分析、轨迹、RNA velocity、调控网络、细胞通讯、空间解卷积等实际使用的方法>\n\n"
-        "【关键细胞群与发育轨迹】\n"
-        "<用 · 分条概括有数据支持的细胞状态、谱系分支和关键分子>\n\n"
-        "【空间定位与分子机制】\n"
-        "<空间结果及机制证据；没有空间数据时明确写‘本研究无空间组学数据’>\n\n"
-        "【证据边界与局限】\n"
-        "<2-3 点，包括物种外推、样本/批次、时间点、验证实验和因果性限制>\n\n"
-        "【对内耳发育研究的价值】\n"
-        "<说明可复用的数据、标记物、分析框架或实验启示>"
     )
+    if "AI与类器官交叉研究" in category:
+        system_prompt = (
+            "你是专注类器官、计算生物学、机器学习和生物医学图像分析的研究专家。"
+            + evidence_rules
+            + "严格使用以下格式：\n"
+            "【中文标题】<专业、忠实翻译英文标题>\n\n"
+            "【一句话结论】\n"
+            "<AI 方法解决了什么类器官问题，实际价值如何>\n\n"
+            "【类器官体系与AI任务】\n"
+            "<类器官来源、疾病/器官类型、输入模态，以及分类、分割、表型、质控、预测或优化任务>\n\n"
+            "【数据集与分析流程】\n"
+            "<样本/图像/患者数量、数据划分、预处理、模型架构、基线和评价指标；未报告则标明>\n\n"
+            "【模型性能与生物学发现】\n"
+            "<用 · 分条报告主要指标、比较结果，以及获得的数据支持的生物学发现>\n\n"
+            "【验证、可解释性与泛化】\n"
+            "<外部验证、交叉验证、消融、可解释性、跨批次/中心/类器官体系泛化>\n\n"
+            "【证据边界与局限】\n"
+            "<2-3 点，特别关注数据泄漏、小样本、患者级划分、类别不平衡和缺少外部验证>\n\n"
+            "【对类器官研究的价值】\n"
+            "<说明能否用于自动质控、规模化筛选、药物反应预测或培养方案优化>"
+        )
+    else:
+        system_prompt = (
+            "你是专注内耳发育、单细胞组学和空间组学的研究专家。"
+            + evidence_rules
+            + "严格使用以下格式：\n"
+            "【中文标题】<专业、忠实翻译英文标题>\n\n"
+            "【一句话结论】\n"
+            "<这项研究对内耳发育最重要的贡献；若相关性有限需直说>\n\n"
+            "【发育问题与实验体系】\n"
+            "<物种/组织或类器官、发育阶段或时间点、关键处理；未报告则明确标注>\n\n"
+            "【数据与分析流程】\n"
+            "<样本量、scRNA-seq/snRNA-seq/空间平台，以及质控、整合、聚类、注释、"
+            "差异分析、轨迹、RNA velocity、调控网络、细胞通讯、空间解卷积等实际使用的方法>\n\n"
+            "【关键细胞群与发育轨迹】\n"
+            "<用 · 分条概括有数据支持的细胞状态、谱系分支和关键分子>\n\n"
+            "【空间定位与分子机制】\n"
+            "<空间结果及机制证据；没有空间数据时明确写‘本研究无空间组学数据’>\n\n"
+            "【证据边界与局限】\n"
+            "<2-3 点，包括物种外推、样本/批次、时间点、验证实验和因果性限制>\n\n"
+            "【对内耳发育研究的价值】\n"
+            "<说明可复用的数据、标记物、分析框架或实验启示>"
+        )
 
     try:
         client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
@@ -522,11 +608,16 @@ def generate_detailed_report(article: dict, text_content: str) -> tuple[str, str
 REPORT_HEADING_MAP = [
     ("【一句话结论】", "\n**一句话结论**"),
     ("【发育问题与实验体系】", "\n**发育问题与实验体系**"),
+    ("【类器官体系与AI任务】", "\n**类器官体系与 AI 任务**"),
     ("【数据与分析流程】", "\n**数据与分析流程**"),
+    ("【数据集与分析流程】", "\n**数据集与分析流程**"),
     ("【关键细胞群与发育轨迹】", "\n**关键细胞群与发育轨迹**"),
     ("【空间定位与分子机制】", "\n**空间定位与分子机制**"),
+    ("【模型性能与生物学发现】", "\n**模型性能与生物学发现**"),
+    ("【验证、可解释性与泛化】", "\n**验证、可解释性与泛化**"),
     ("【证据边界与局限】", "\n**证据边界与局限**"),
     ("【对内耳发育研究的价值】", "\n**对内耳发育研究的价值**"),
+    ("【对类器官研究的价值】", "\n**对类器官研究的价值**"),
 ]
 
 
