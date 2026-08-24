@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PubMed 文献检索 + AI 全文解读（详细中文报告）+ 企业微信推送
+内耳发育文献检索 + 单细胞/空间组学优先排序 + AI 证据化解读 + 企业微信推送
 """
 
 import os
@@ -17,32 +17,64 @@ from openai import OpenAI
 # ============================================================
 # 全局配置
 # ============================================================
+REVIEW_EXCLUSION = (
+    'NOT (Review[Publication Type] OR Systematic Review[Publication Type] '
+    'OR Meta-Analysis[Publication Type])'
+)
+
 SEARCH_QUERIES = {
-    "AI与类器官工程": (
-        '(organoid*[Title/Abstract] OR "virtual organoid"[Title/Abstract] '
-        'OR "tissue engineering"[Title/Abstract]) '
-        'AND ("artificial intelligence"[Title/Abstract] '
-        'OR "machine learning"[Title/Abstract] '
-        'OR "deep learning"[Title/Abstract] '
-        'OR "digital twin"[Title/Abstract] '
-        'OR "neural differential equation"[Title/Abstract] '
-        'OR "trajectory learning"[Title/Abstract] '
-        'OR "computational modeling"[Title/Abstract] '
-        'OR "protocol optimization"[Title/Abstract])'
+    "内耳发育·单细胞与空间组学": (
+        '("inner ear"[Title/Abstract] OR cochlea*[Title/Abstract] '
+        'OR cochlear[Title/Abstract] OR vestibular[Title/Abstract] '
+        'OR otic[Title/Abstract] OR "hair cell"[Title/Abstract] '
+        'OR "spiral ganglion"[Title/Abstract]) '
+        'AND (develop*[Title/Abstract] OR differentiati*[Title/Abstract] '
+        'OR morphogen*[Title/Abstract] OR lineage[Title/Abstract] '
+        'OR "cell fate"[Title/Abstract] OR regeneration[Title/Abstract]) '
+        'AND ("single-cell RNA sequencing"[Title/Abstract] '
+        'OR "single cell RNA sequencing"[Title/Abstract] '
+        'OR "single-cell transcriptom*"[Title/Abstract] '
+        'OR "single-nucleus RNA sequencing"[Title/Abstract] '
+        'OR "single nucleus RNA sequencing"[Title/Abstract] '
+        'OR scRNA-seq[Title/Abstract] OR scRNAseq[Title/Abstract] '
+        'OR snRNA-seq[Title/Abstract] OR "spatial transcriptomics"[Title/Abstract] '
+        'OR "spatially resolved transcriptomics"[Title/Abstract] '
+        'OR "spatial omics"[Title/Abstract]) '
+        f'{REVIEW_EXCLUSION}'
     ),
-    "内耳与类器官研究": (
-        '(organoid*[Title/Abstract] OR "in vitro model"[Title/Abstract] '
-        'OR mechanobiolog*[Title/Abstract] '
-        'OR "extracellular matrix"[Title/Abstract]) '
-        'AND ("inner ear"[Title/Abstract] '
-        'OR cochlea*[Title/Abstract] '
-        'OR vestibular[Title/Abstract] '
-        'OR "hair cell"[Title/Abstract])'
+    "内耳发育·机制与类器官": (
+        '("inner ear"[Title/Abstract] OR cochlea*[Title/Abstract] '
+        'OR cochlear[Title/Abstract] OR "otic placode"[Title/Abstract] '
+        'OR "otic vesicle"[Title/Abstract] OR "hair cell"[Title/Abstract] '
+        'OR "spiral ganglion"[Title/Abstract]) '
+        'AND (develop*[Title/Abstract] OR differentiati*[Title/Abstract] '
+        'OR morphogen*[Title/Abstract] OR lineage[Title/Abstract] '
+        'OR "cell fate"[Title/Abstract] OR "lineage specification"[Title/Abstract]) '
+        'AND (organoid*[Title/Abstract] OR embryo*[Title/Abstract] '
+        'OR "stem cell"[Title/Abstract] OR progenitor*[Title/Abstract] '
+        'OR "in vitro"[Title/Abstract]) '
+        f'{REVIEW_EXCLUSION}'
     ),
 }
 SEARCH_DAYS = 7
-MAX_RESULTS = 20          # 每个检索式最多取 N 篇
-FETCH_FULL_TEXT = True     # True=下载PMC全文，False=仅用摘要
+MAX_RESULTS = 30           # 每个检索式先抓取较大的候选集，再在本地筛选排序
+MAX_PUSH_ARTICLES = 8      # 每周最多推送，避免低相关文献挤占阅读时间
+FETCH_FULL_TEXT = True     # True=下载并核验 PMC 全文，False=仅用摘要
+MAX_ANALYSIS_CHARS = 18000
+
+REVIEW_PUBLICATION_TYPES = {"review", "systematic review", "meta-analysis"}
+SPATIAL_KEYWORDS = (
+    "spatial transcript", "spatial omics", "spatially resolved", "visium",
+    "slide-seq", "merfish", "seqfish", "stereo-seq",
+)
+SINGLE_CELL_KEYWORDS = (
+    "single-cell", "single cell", "single-nucleus", "single nucleus",
+    "scrna-seq", "scrnaseq", "snrna-seq", "rna velocity",
+)
+DEVELOPMENT_KEYWORDS = (
+    "development", "developmental", "differentiation", "morphogenesis",
+    "lineage", "cell fate", "otic placode", "otic vesicle",
+)
 
 # ============================================================
 # API 配置（全部通过环境变量读取）
@@ -116,6 +148,16 @@ def parse_articles(xml_data: str) -> list[dict]:
                     abstract_parts.append(f"{label}: {text}" if label else text)
             article["abstract"] = "\n".join(abstract_parts)
 
+            # Publication types（用于在检索式之外再次排除综述）
+            publication_types = []
+            publication_type_list = art.find("PublicationTypeList")
+            if publication_type_list is not None:
+                for pt in publication_type_list.findall("PublicationType"):
+                    value = "".join(pt.itertext()).strip()
+                    if value:
+                        publication_types.append(value)
+            article["publication_types"] = publication_types
+
             # Authors
             authors = []
             author_list = art.find(".//AuthorList")
@@ -145,37 +187,38 @@ def parse_articles(xml_data: str) -> list[dict]:
                         if year is not None: parts.append(year.text)
                         if month is not None: parts.append(month.text)
                         if day is not None: parts.append(day.text)
+                        if not parts:
+                            medline_date = pd.find("MedlineDate")
+                            if medline_date is not None and medline_date.text:
+                                parts.append(medline_date.text)
                         article["date"] = " ".join(parts)
                     else:
                         article["date"] = ""
             else:
                 article["journal"] = article["date"] = ""
 
-            # DOI
+            # 只读取当前文献自己的 ArticleIdList。
+            # 不能使用 .//ArticleIdList，否则会误取参考文献的 DOI/PMCID。
+            article_id_list = article_elem.find("./PubmedData/ArticleIdList")
             doi = ""
-            for eid in article_elem.findall(".//ArticleIdList/ArticleId"):
-                if eid.get("IdType") == "doi":
-                    doi = eid.text or ""
-                    break
-            article["doi"] = doi
-
-            # PMC ID（用于全文下载）
             pmc_id = ""
-            # PubmedData 中的 ArticleIdList
-            pubmed_data = article_elem.find(".//PubmedData")
-            if pubmed_data is not None:
-                for eid in pubmed_data.findall(".//ArticleIdList/ArticleId"):
-                    if eid.get("IdType") in ("pmc", "pmcid", "PMC"):
+            if article_id_list is not None:
+                for eid in article_id_list.findall("ArticleId"):
+                    id_type = (eid.get("IdType") or "").lower()
+                    if id_type == "doi" and not doi:
+                        doi = (eid.text or "").strip()
+                    elif id_type in ("pmc", "pmcid") and not pmc_id:
                         raw = eid.text or ""
                         pmc_id = raw if raw.startswith("PMC") else f"PMC{raw}"
+
+            # 少数记录的 DOI 仅出现在 ELocationID 中。
+            if not doi:
+                for location_id in art.findall("ELocationID"):
+                    if (location_id.get("EIdType") or "").lower() == "doi":
+                        doi = (location_id.text or "").strip()
                         break
-            # MedlineCitation 中的 ArticleIdList（兜底）
-            if not pmc_id:
-                for eid in article_elem.findall(".//MedlineCitation//ArticleIdList/ArticleId"):
-                    if eid.get("IdType") in ("pmc", "pmcid", "PMC"):
-                        raw = eid.text or ""
-                        pmc_id = raw if raw.startswith("PMC") else f"PMC{raw}"
-                        break
+
+            article["doi"] = doi
             article["pmc_id"] = pmc_id
 
             # 链接
@@ -188,6 +231,78 @@ def parse_articles(xml_data: str) -> list[dict]:
             continue
 
     return articles
+
+
+# ============================================================
+#  综述过滤与相关性排序
+# ============================================================
+def contains_any(text: str, keywords: tuple[str, ...]) -> bool:
+    lowered = (text or "").lower()
+    return any(keyword in lowered for keyword in keywords)
+
+
+def is_review_article(article: dict) -> bool:
+    publication_types = {
+        value.strip().lower() for value in article.get("publication_types", [])
+    }
+    if publication_types & REVIEW_PUBLICATION_TYPES:
+        return True
+
+    # PublicationType 偶有缺失，用题名做保守兜底。
+    title = (article.get("title") or "").strip().lower()
+    review_markers = (
+        "systematic review", "scoping review", "narrative review",
+        "a review", "review of", "meta-analysis",
+    )
+    return any(marker in title for marker in review_markers)
+
+
+def article_relevance_score(article: dict) -> int:
+    """优先空间组学，其次单细胞，再次一般内耳发育原创研究。"""
+    title = article.get("title") or ""
+    abstract = article.get("abstract") or ""
+    text = f"{title}\n{abstract}".lower()
+    title_lower = title.lower()
+    category = article.get("category", "")
+
+    score = 0
+    if "单细胞与空间组学" in category:
+        score += 100
+    if contains_any(text, SPATIAL_KEYWORDS):
+        score += 45
+    if contains_any(text, SINGLE_CELL_KEYWORDS):
+        score += 35
+    if contains_any(title_lower, SPATIAL_KEYWORDS):
+        score += 15
+    if contains_any(title_lower, SINGLE_CELL_KEYWORDS):
+        score += 12
+    if contains_any(text, DEVELOPMENT_KEYWORDS):
+        score += 12
+    if "organoid" in text:
+        score += 6
+    if article.get("abstract"):
+        score += 2
+    return score
+
+
+def filter_and_rank_articles(articles: list[dict]) -> list[dict]:
+    original_articles = []
+    for article in articles:
+        if is_review_article(article):
+            types = ", ".join(article.get("publication_types", [])) or "标题判定"
+            print(f"      [FILTER] 排除综述: {article.get('title', '')[:70]} ({types})")
+            continue
+        article["relevance_score"] = article_relevance_score(article)
+        original_articles.append(article)
+
+    # Python 排序稳定；同分时保留 PubMed 的日期排序。
+    original_articles.sort(key=lambda item: item["relevance_score"], reverse=True)
+    selected = original_articles[:MAX_PUSH_ARTICLES]
+    print(
+        f"      -> 排除综述后 {len(original_articles)} 篇，"
+        f"按空间组学/单细胞优先选取 {len(selected)} 篇"
+    )
+    return selected
 
 
 # ============================================================
@@ -206,37 +321,119 @@ def fetch_pmc_fulltext(pmc_id: str) -> str:
         return ""
 
 
-def extract_pmc_body(xml_data: str) -> str:
-    """从 PMC XML 中提取正文全部段落"""
-    if not xml_data:
-        return ""
+def pmc_matches_article(xml_data: str, expected_pmid: str) -> bool:
+    """防止把参考文献的 PMCID 当成当前文献全文。"""
+    if not xml_data or not expected_pmid:
+        return True
     try:
         root = ET.fromstring(xml_data)
-        body = root.find(".//body")
-        if body is None:
-            return ""
+        pmids = {
+            (node.text or "").strip()
+            for node in root.findall(".//front//article-id")
+            if (node.get("pub-id-type") or "").lower() == "pmid"
+        }
+        return not pmids or expected_pmid in pmids
+    except ET.ParseError:
+        return False
 
-        paragraphs = []
-        for sec in body.iter():
-            if sec.tag == "sec":
-                stitle = sec.find("title")
-                if stitle is not None and stitle.text:
-                    paragraphs.append(f"\n## {stitle.text.strip()}")
-            elif sec.tag == "p":
-                text = "".join(sec.itertext()).strip()
-                if text:
-                    paragraphs.append(text)
 
-        return "\n\n".join(paragraphs)
+def node_text(node) -> str:
+    if node is None:
+        return ""
+    return " ".join("".join(node.itertext()).split())
+
+
+def extract_pmc_sections(xml_data: str) -> list[tuple[str, str]]:
+    """按章节提取全文，避免简单截取前 15000 字导致结果部分丢失。"""
+    root = ET.fromstring(xml_data)
+    sections = []
+
+    abstract = root.find(".//front//article-meta/abstract")
+    abstract_text = node_text(abstract)
+    if abstract_text:
+        sections.append(("Abstract", abstract_text))
+
+    body = root.find(".//body")
+    if body is None:
+        return sections
+
+    front_paragraphs = [node_text(p) for p in body.findall("./p")]
+    front_text = "\n".join(text for text in front_paragraphs if text)
+    if front_text:
+        sections.append(("Body", front_text))
+
+    # 每个 sec 只取直属段落；子章节会在后续循环中单独处理，避免重复。
+    for index, sec in enumerate(body.findall(".//sec"), 1):
+        title = node_text(sec.find("./title")) or f"Section {index}"
+        paragraphs = [node_text(p) for p in sec.findall("./p")]
+        section_text = "\n".join(text for text in paragraphs if text)
+        if section_text:
+            sections.append((title, section_text))
+    return sections
+
+
+def prepare_pmc_text_for_ai(
+    xml_data: str, expected_pmid: str, max_chars: int = MAX_ANALYSIS_CHARS
+) -> str:
+    """均衡抽取摘要、方法、结果和讨论，保留组学分析所需信息。"""
+    if not pmc_matches_article(xml_data, expected_pmid):
+        print(f"      [WARN] PMC 全文 PMID 与目标 PMID {expected_pmid} 不一致，已拒绝")
+        return ""
+
+    try:
+        sections = extract_pmc_sections(xml_data)
     except Exception as e:
         print(f"      [WARN] PMC XML 解析失败: {e}")
         return ""
+    if not sections:
+        return ""
+
+    group_specs = [
+        ("摘要", ("abstract",), 2500),
+        ("方法", ("method", "material", "experimental", "data analysis"), 4500),
+        ("结果", ("result", "finding"), 6500),
+        ("讨论与结论", ("discussion", "conclusion", "summary"), 3500),
+        ("背景", ("introduction", "background"), 1500),
+    ]
+    used = set()
+    blocks = []
+
+    for group_name, keywords, group_budget in group_specs:
+        remaining = group_budget
+        for index, (title, text) in enumerate(sections):
+            if index in used or not any(key in title.lower() for key in keywords):
+                continue
+            prefix = f"## {group_name} / {title}\n"
+            allowance = max(0, remaining - len(prefix))
+            if allowance == 0:
+                break
+            snippet = text[:allowance]
+            blocks.append(prefix + snippet)
+            used.add(index)
+            remaining -= len(prefix) + len(snippet)
+            if remaining <= 0:
+                break
+
+    # 对命名不标准的章节做兜底补充。
+    current_length = sum(len(block) for block in blocks)
+    for index, (title, text) in enumerate(sections):
+        if index in used or current_length >= max_chars:
+            continue
+        prefix = f"## 其他正文 / {title}\n"
+        allowance = max_chars - current_length - len(prefix)
+        if allowance <= 0:
+            break
+        snippet = text[:min(allowance, 2500)]
+        blocks.append(prefix + snippet)
+        current_length += len(prefix) + len(snippet)
+
+    return "\n\n".join(blocks)[:max_chars]
 
 
 # ============================================================
 #  AI 标题翻译 + 详细文献解读
 # ============================================================
-def generate_detailed_report(title: str, text_content: str) -> tuple[str, str]:
+def generate_detailed_report(article: dict, text_content: str) -> tuple[str, str]:
     """
     返回 (translated_title, report)
     translated_title: 中文翻译标题
@@ -248,29 +445,43 @@ def generate_detailed_report(title: str, text_content: str) -> tuple[str, str]:
         return "", "（未配置 LLM_API_KEY）"
 
     system_prompt = (
-        "你是一个资深的医学与生物学研究专家。请对以下文献进行深入的中文解读。\n\n"
-        "输出格式要求如下：\n"
-        "【中文标题】<将英文标题翻译为专业通顺的中文标题>\n\n"
-        "【研究背景与目的】\n"
-        "<2-3 句话，保持精炼>\n\n"
-        "【实验模型与方法】\n"
-        "<介绍关键实验模型和技术，保持精炼>\n\n"
-        "【核心发现】\n"
-        "<每条用 · 开头，分条列出最重要的发现，每条1句话>\n\n"
-        "【结论与意义】\n"
-        "<1-2 句话>\n\n"
-        "【局限性】\n"
-        "<1 句话>"
+        "你是专注内耳发育、单细胞组学和空间组学的研究专家。"
+        "请只依据用户提供的论文文本进行中文解读，不得用常识补齐论文未报告的信息，"
+        "不得虚构样本量、发育时期、基因、细胞群、统计显著性或分析软件。"
+        "如果文本是摘要，必须降低结论强度；任何关键信息缺失时写‘原文未报告’。"
+        "区分作者数据支持的结论与作者讨论中的推测。全文控制在 700-900 个中文字符。\n\n"
+        "严格使用以下格式：\n"
+        "【中文标题】<专业、忠实翻译英文标题>\n\n"
+        "【一句话结论】\n"
+        "<这项研究对内耳发育最重要的贡献；若相关性有限需直说>\n\n"
+        "【发育问题与实验体系】\n"
+        "<物种/组织或类器官、发育阶段或时间点、关键处理；未报告则明确标注>\n\n"
+        "【数据与分析流程】\n"
+        "<样本量、scRNA-seq/snRNA-seq/空间平台，以及质控、整合、聚类、注释、"
+        "差异分析、轨迹、RNA velocity、调控网络、细胞通讯、空间解卷积等实际使用的方法>\n\n"
+        "【关键细胞群与发育轨迹】\n"
+        "<用 · 分条概括有数据支持的细胞状态、谱系分支和关键分子>\n\n"
+        "【空间定位与分子机制】\n"
+        "<空间结果及机制证据；没有空间数据时明确写‘本研究无空间组学数据’>\n\n"
+        "【证据边界与局限】\n"
+        "<2-3 点，包括物种外推、样本/批次、时间点、验证实验和因果性限制>\n\n"
+        "【对内耳发育研究的价值】\n"
+        "<说明可复用的数据、标记物、分析框架或实验启示>"
     )
 
     try:
         client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
 
-        # 判断是全文还是摘要，相应地调整提示
-        is_full_text = len(text_content) > 2000
+        title = article.get("title", "")
+        source = article.get("analysis_source", "PubMed 摘要")
+        publication_types = ", ".join(article.get("publication_types", [])) or "未报告"
         user_prompt = (
             f"【英文标题】\n{title}\n\n"
-            f"【{'全文' if is_full_text else '摘要'}】\n"
+            f"【期刊】{article.get('journal', '未知')}\n"
+            f"【文献类型】{publication_types}\n"
+            f"【解读依据】{source}\n\n"
+            "注意：只有在下方文本明确出现时，才能报告具体实验或计算分析步骤。\n\n"
+            f"【论文文本】\n"
             f"{text_content}"
         )
 
@@ -280,8 +491,8 @@ def generate_detailed_report(title: str, text_content: str) -> tuple[str, str]:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.3,
-            max_tokens=2000,
+            temperature=0.1,
+            max_tokens=1600,
         )
         result = resp.choices[0].message.content.strip()
 
@@ -306,6 +517,28 @@ def generate_detailed_report(title: str, text_content: str) -> tuple[str, str]:
         return translated_title, report
     except Exception as e:
         return "", f"（AI 解读生成失败: {e}）"
+
+
+REPORT_HEADING_MAP = [
+    ("【一句话结论】", "\n**一句话结论**"),
+    ("【发育问题与实验体系】", "\n**发育问题与实验体系**"),
+    ("【数据与分析流程】", "\n**数据与分析流程**"),
+    ("【关键细胞群与发育轨迹】", "\n**关键细胞群与发育轨迹**"),
+    ("【空间定位与分子机制】", "\n**空间定位与分子机制**"),
+    ("【证据边界与局限】", "\n**证据边界与局限**"),
+    ("【对内耳发育研究的价值】", "\n**对内耳发育研究的价值**"),
+]
+
+
+def format_report_for_wecom(report: str) -> str:
+    clean = (report or "").strip()
+    if "【中文标题】" in clean:
+        positions = [clean.find(old) for old, _ in REPORT_HEADING_MAP if old in clean]
+        if positions:
+            clean = clean[min(positions):]
+    for old, new in REPORT_HEADING_MAP:
+        clean = clean.replace(old, new)
+    return clean.strip()
 
 
 # ============================================================
@@ -347,6 +580,7 @@ def build_wecom_markdown(articles_with_reports: list[dict]) -> str:
         lines.append(f"**作者：**{authors}")
         lines.append(f"**期刊：**{art.get('journal', '未知')}")
         lines.append(f"**日期：**{art.get('date', '未知')}")
+        lines.append(f"**解读依据：**{art.get('analysis_source', 'PubMed 摘要')}")
 
         links = []
         if art.get("pmid_link"):
@@ -361,21 +595,7 @@ def build_wecom_markdown(articles_with_reports: list[dict]) -> str:
 
         # --- 详细报告 ---
         if report:
-            clean = report
-            if "【中文标题】" in clean:
-                idx = clean.find("【研究背景与目的】")
-                if idx != -1:
-                    clean = clean[idx:]
-            for old, new in [
-                ("【研究背景与目的】", "\n**背景与目的**"),
-                ("【实验模型与方法】", "\n**方法与模型**"),
-                ("【核心发现】", "\n**核心发现**"),
-                ("【结论与意义】", "\n**结论与意义**"),
-                ("【局限性】", "\n**局限性**"),
-            ]:
-                clean = clean.replace(old, new)
-            clean = clean.strip()
-            lines.append(clean)
+            lines.append(format_report_for_wecom(report))
 
         lines.append("")
         lines.append("---")
@@ -432,6 +652,7 @@ def push_to_wecom_bot(articles_with_reports: list[dict]):
         lines.append(f"**作者：**{art.get('authors', '未知')[:60]}")
         lines.append(f"**期刊：**{art.get('journal', '未知')}")
         lines.append(f"**日期：**{art.get('date', '未知')}")
+        lines.append(f"**解读依据：**{art.get('analysis_source', 'PubMed 摘要')}")
         links = []
         if art.get("pmid_link"):
             links.append(f"[PubMed]({art['pmid_link']})")
@@ -443,21 +664,7 @@ def push_to_wecom_bot(articles_with_reports: list[dict]):
             lines.append(f"**链接：**{' | '.join(links)}")
         lines.append("")
         if report:
-            clean = report
-            if "【中文标题】" in clean:
-                idx = clean.find("【研究背景与目的】")
-                if idx != -1:
-                    clean = clean[idx:]
-            for old, new in [
-                ("【研究背景与目的】", "\n**背景与目的**"),
-                ("【实验模型与方法】", "\n**方法与模型**"),
-                ("【核心发现】", "\n**核心发现**"),
-                ("【结论与意义】", "\n**结论与意义**"),
-                ("【局限性】", "\n**局限性**"),
-            ]:
-                clean = clean.replace(old, new)
-            clean = clean.strip()
-            lines.append(clean)
+            lines.append(format_report_for_wecom(report))
         one = "\n".join(lines)
         e = one.encode("utf-8")
         if len(e) > max_bytes:
@@ -511,9 +718,15 @@ def main():
     # 标记分类
     for art in articles:
         art["category"] = pmid_category.get(art.get("pmid", ""), "")
-    print(f"      -> 成功解析 {len(articles)} 篇文献")
+    print(f"      -> 成功解析 {len(articles)} 篇候选文献")
     if not articles:
         print("[DONE] 未解析到有效文献")
+        return
+
+    articles = filter_and_rank_articles(articles)
+    if not articles:
+        print("[DONE] 候选文献均为综述或未通过筛选")
+        push_to_wecom_bot([])
         return
 
     # 打印 PMC 可用情况
@@ -528,16 +741,24 @@ def main():
             print(f"      [{i}/{len(articles)}] {title_short} (PMC: {art['pmc_id']})")
             pmc_xml = fetch_pmc_fulltext(art["pmc_id"])
             if pmc_xml:
-                body = extract_pmc_body(pmc_xml)
-                if len(body) > 15000:
-                    body = body[:15000] + "\n\n[全文过长，已截取前15000字符]"
-                art["full_text"] = body
-                print(f"            全文 {len(body)} 字符")
+                analysis_text = prepare_pmc_text_for_ai(
+                    pmc_xml, art.get("pmid", ""), MAX_ANALYSIS_CHARS
+                )
+                if analysis_text:
+                    art["analysis_text"] = analysis_text
+                    art["analysis_source"] = "经 PMID 核验的 PMC 全文"
+                    print(f"            全文均衡抽取 {len(analysis_text)} 字符")
+                else:
+                    art["analysis_text"] = art.get("abstract", "")
+                    art["analysis_source"] = "PubMed 摘要（PMC 核验/解析失败）"
+                    print("            PMC 核验/解析失败，回退到摘要")
             else:
-                art["full_text"] = art.get("abstract", "")
+                art["analysis_text"] = art.get("abstract", "")
+                art["analysis_source"] = "PubMed 摘要（PMC 下载失败）"
                 print(f"            下载失败，回退到摘要")
         else:
-            art["full_text"] = art.get("abstract", "")
+            art["analysis_text"] = art.get("abstract", "")
+            art["analysis_source"] = "PubMed 摘要"
             print(f"      [{i}/{len(articles)}] {title_short} (摘要)")
 
     # ---- [4/5] AI 解读 ----
@@ -546,8 +767,8 @@ def main():
     for i, art in enumerate(articles, 1):
         title_short = (art.get("title") or "")[:40]
         print(f"      [{i}/{len(articles)}] {title_short}")
-        text = art.get("full_text") or art.get("abstract", "")
-        ttitle, report = generate_detailed_report(art.get("title", ""), text)
+        text = art.get("analysis_text") or art.get("abstract", "")
+        ttitle, report = generate_detailed_report(art, text)
         articles_with_reports.append({
             "article": art,
             "translated_title": ttitle,
