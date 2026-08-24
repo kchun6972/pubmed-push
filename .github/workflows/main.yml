@@ -1,4 +1,4 @@
-name: PubMed Weekly Push
+name: Inner Ear Development Weekly Push
 
 on:
   schedule:
@@ -24,7 +24,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 运行 PubMed 文献推送
+      - name: 运行内耳发育文献推送
         env:
           ENTREZ_EMAIL: ${{ secrets.ENTREZ_EMAIL }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
